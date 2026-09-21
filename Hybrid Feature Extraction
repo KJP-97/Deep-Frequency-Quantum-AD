@@ -1,0 +1,483 @@
+# ================================================================
+# Hybrid Feature Extraction for Alzheimer's Disease MRI
+# EfficientNet-B4 + Radiomics + WPT + LBP
+# ================================================================
+
+import cv2
+import numpy as np
+import pywt
+import torch
+import torch.nn as nn
+
+from pathlib import Path
+from PIL import Image
+
+from torchvision import models, transforms
+from skimage.feature import local_binary_pattern
+
+import SimpleITK as sitk
+import radiomics
+
+
+# ================================================================
+# 1. Configuration
+# ================================================================
+
+IMAGE_SIZE = 224
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+WAVELET = "db4"
+WPT_LEVEL = 3
+
+LBP_RADIUS = 1
+LBP_POINTS = 8
+
+
+# ================================================================
+# 2. EfficientNet-B4 Deep Feature Extractor
+# ================================================================
+
+def build_efficientnet():
+
+    model = models.efficientnet_b4(
+        weights=models.EfficientNet_B4_Weights.DEFAULT
+    )
+
+    # Remove final classification layer
+    model.classifier = nn.Identity()
+
+    model = model.to(DEVICE)
+    model.eval()
+
+    return model
+
+
+efficientnet_model = build_efficientnet()
+
+
+image_transform = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.Grayscale(num_output_channels=3),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
+
+
+def extract_deep_features(image_path):
+
+    image = Image.open(image_path).convert("L")
+
+    tensor = image_transform(image)
+    tensor = tensor.unsqueeze(0).to(DEVICE)
+
+    with torch.no_grad():
+
+        features = efficientnet_model(tensor)
+
+    return features.cpu().numpy().flatten()
+
+
+# ================================================================
+# 3. Radiomic Feature Extraction
+# ================================================================
+
+def extract_radiomic_features(image_path):
+
+    image = sitk.ReadImage(str(image_path))
+
+    # Convert MRI image into SimpleITK mask
+    image_array = sitk.GetArrayFromImage(image)
+
+    mask_array = np.ones_like(
+        image_array,
+        dtype=np.uint8
+    )
+
+    mask = sitk.GetImageFromArray(mask_array)
+    mask.CopyInformation(image)
+
+    extractor = radiomics.featureextractor.RadiomicsFeatureExtractor()
+
+    result = extractor.execute(
+        image,
+        mask
+    )
+
+    features = []
+
+    for key, value in result.items():
+
+        if key.startswith("diagnostics"):
+            continue
+
+        try:
+            features.append(float(value))
+        except (TypeError, ValueError):
+            continue
+
+    return np.asarray(
+        features,
+        dtype=np.float32
+    )
+
+
+# ================================================================
+# 4. Wavelet Packet Transform Features
+# ================================================================
+
+def extract_wpt_features(
+    image_path,
+    wavelet=WAVELET,
+    level=WPT_LEVEL
+):
+
+    image = cv2.imread(
+        str(image_path),
+        cv2.IMREAD_GRAYSCALE
+    )
+
+    if image is None:
+        raise ValueError(
+            f"Unable to read image: {image_path}"
+        )
+
+    image = cv2.resize(
+        image,
+        (IMAGE_SIZE, IMAGE_SIZE)
+    )
+
+    image = image.astype(np.float32) / 255.0
+
+    wp = pywt.WaveletPacket2D(
+        data=image,
+        wavelet=wavelet,
+        mode="symmetric",
+        maxlevel=level
+    )
+
+    nodes = wp.get_level(
+        level,
+        order="natural"
+    )
+
+    features = []
+
+    for node in nodes:
+
+        coefficients = node.data
+
+        # Mean
+        features.append(
+            np.mean(coefficients)
+        )
+
+        # Standard deviation
+        features.append(
+            np.std(coefficients)
+        )
+
+        # Energy
+        features.append(
+            np.sum(coefficients ** 2)
+        )
+
+        # Entropy
+        magnitude = np.abs(coefficients)
+
+        probability = (
+            magnitude /
+            (np.sum(magnitude) + 1e-12)
+        )
+
+        entropy = -np.sum(
+            probability *
+            np.log2(probability + 1e-12)
+        )
+
+        features.append(entropy)
+
+    return np.asarray(
+        features,
+        dtype=np.float32
+    )
+
+
+# ================================================================
+# 5. Local Binary Pattern Texture Features
+# ================================================================
+
+def extract_lbp_features(
+    image_path,
+    radius=LBP_RADIUS,
+    points=LBP_POINTS
+):
+
+    image = cv2.imread(
+        str(image_path),
+        cv2.IMREAD_GRAYSCALE
+    )
+
+    if image is None:
+        raise ValueError(
+            f"Unable to read image: {image_path}"
+        )
+
+    image = cv2.resize(
+        image,
+        (IMAGE_SIZE, IMAGE_SIZE)
+    )
+
+    lbp = local_binary_pattern(
+        image,
+        points,
+        radius,
+        method="uniform"
+    )
+
+    n_bins = points + 2
+
+    histogram, _ = np.histogram(
+        lbp.ravel(),
+        bins=np.arange(
+            0,
+            n_bins + 1
+        ),
+        range=(0, n_bins)
+    )
+
+    histogram = histogram.astype(
+        np.float32
+    )
+
+    histogram /= (
+        np.sum(histogram) + 1e-12
+    )
+
+    return histogram
+
+
+# ================================================================
+# 6. Feature Normalization
+# ================================================================
+
+def normalize_features(features):
+
+    features = np.asarray(
+        features,
+        dtype=np.float32
+    )
+
+    mean = np.mean(
+        features,
+        axis=0,
+        keepdims=True
+    )
+
+    std = np.std(
+        features,
+        axis=0,
+        keepdims=True
+    )
+
+    return (
+        features - mean
+    ) / (
+        std + 1e-8
+    )
+
+
+# ================================================================
+# 7. Complete Hybrid Feature Extraction
+# ================================================================
+
+def extract_hybrid_features(image_path):
+
+    print(
+        f"\nExtracting features from: "
+        f"{image_path}"
+    )
+
+    # ------------------------------------------------------------
+    # Deep features
+    # ------------------------------------------------------------
+
+    deep_features = extract_deep_features(
+        image_path
+    )
+
+    print(
+        "EfficientNet-B4 features:",
+        deep_features.shape
+    )
+
+    # ------------------------------------------------------------
+    # Radiomic features
+    # ------------------------------------------------------------
+
+    radiomic_features = extract_radiomic_features(
+        image_path
+    )
+
+    print(
+        "Radiomic features:",
+        radiomic_features.shape
+    )
+
+    # ------------------------------------------------------------
+    # Frequency-domain features
+    # ------------------------------------------------------------
+
+    wpt_features = extract_wpt_features(
+        image_path
+    )
+
+    print(
+        "WPT features:",
+        wpt_features.shape
+    )
+
+    # ------------------------------------------------------------
+    # Texture features
+    # ------------------------------------------------------------
+
+    lbp_features = extract_lbp_features(
+        image_path
+    )
+
+    print(
+        "LBP features:",
+        lbp_features.shape
+    )
+
+    # ------------------------------------------------------------
+    # Concatenate all feature domains
+    # ------------------------------------------------------------
+
+    hybrid_features = np.concatenate([
+        deep_features,
+        radiomic_features,
+        wpt_features,
+        lbp_features
+    ])
+
+    print(
+        "Final hybrid feature dimension:",
+        hybrid_features.shape
+    )
+
+    return hybrid_features
+
+
+# ================================================================
+# 8. Extract Features from Complete Dataset
+# ================================================================
+
+def extract_dataset_features(
+    dataset_dir,
+    output_file="hybrid_features.npy"
+):
+
+    dataset_dir = Path(dataset_dir)
+
+    extensions = {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".bmp",
+        ".tif",
+        ".tiff"
+    }
+
+    all_features = []
+    image_names = []
+
+    image_files = [
+        p for p in dataset_dir.rglob("*")
+        if p.suffix.lower() in extensions
+    ]
+
+    print(
+        f"\nTotal images found: "
+        f"{len(image_files)}"
+    )
+
+    for image_path in image_files:
+
+        try:
+
+            features = extract_hybrid_features(
+                image_path
+            )
+
+            all_features.append(features)
+            image_names.append(
+                image_path.name
+            )
+
+        except Exception as error:
+
+            print(
+                f"Error processing "
+                f"{image_path}: {error}"
+            )
+
+    if len(all_features) == 0:
+
+        raise RuntimeError(
+            "No features were extracted."
+        )
+
+    # Convert to matrix
+    feature_matrix = np.vstack(
+        all_features
+    )
+
+    # Save features
+    np.save(
+        output_file,
+        feature_matrix
+    )
+
+    np.save(
+        "image_names.npy",
+        np.asarray(image_names)
+    )
+
+    print(
+        "\n======================================"
+    )
+    print(
+        "Feature extraction completed."
+    )
+    print(
+        "Feature matrix:",
+        feature_matrix.shape
+    )
+    print(
+        "Saved:",
+        output_file
+    )
+    print(
+        "======================================"
+    )
+
+    return feature_matrix
+
+
+# ================================================================
+# 9. Example
+# ================================================================
+
+if __name__ == "__main__":
+
+    DATASET_PATH = "data/train"
+
+    features = extract_dataset_features(
+        dataset_dir=DATASET_PATH,
+        output_file="results/hybrid_features.npy"
+    )
