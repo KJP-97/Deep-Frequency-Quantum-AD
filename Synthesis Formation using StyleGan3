@@ -1,0 +1,190 @@
+import os
+import subprocess
+from pathlib import Path
+
+
+# ============================================================
+# StyleGAN3 MRI Synthesis Configuration
+# ============================================================
+
+DATASET_DIR = "data/train"
+OUTPUT_DIR = "synthetic_data/stylegan3/runs"
+
+STYLEGAN3_DIR = "stylegan3"
+
+IMAGE_SIZE = 256
+BATCH_SIZE = 8
+NUM_GPUS = 1
+
+# Manuscript experiment
+EPOCHS = 50
+
+# Save checkpoint periodically
+SNAPSHOT_INTERVAL = 5
+
+
+# ============================================================
+# Estimate number of kimg corresponding to 50 epochs
+# ============================================================
+
+def calculate_kimg(dataset_dir, epochs):
+    """
+    Convert epoch-based training into StyleGAN3 kimg.
+
+    1 kimg = 1000 training images.
+    """
+
+    extensions = {
+        ".jpg", ".jpeg", ".png",
+        ".bmp", ".tif", ".tiff"
+    }
+
+    image_count = sum(
+        1
+        for file in Path(dataset_dir).rglob("*")
+        if file.suffix.lower() in extensions
+    )
+
+    if image_count == 0:
+        raise RuntimeError(
+            f"No images found in {dataset_dir}"
+        )
+
+    total_images = image_count * epochs
+
+    kimg = max(
+        1,
+        round(total_images / 1000)
+    )
+
+    print(f"Training images : {image_count}")
+    print(f"Training epochs : {epochs}")
+    print(f"Approx. kimg    : {kimg}")
+
+    return kimg
+
+
+# ============================================================
+# Train StyleGAN3
+# ============================================================
+
+def train_stylegan3():
+
+    os.makedirs(
+        OUTPUT_DIR,
+        exist_ok=True
+    )
+
+    kimg = calculate_kimg(
+        DATASET_DIR,
+        EPOCHS
+    )
+
+    dataset_zip = (
+        f"synthetic_data/stylegan3/"
+        f"mri_dataset_{IMAGE_SIZE}.zip"
+    )
+
+    command = [
+        "python",
+        os.path.join(
+            STYLEGAN3_DIR,
+            "train.py"
+        ),
+
+        "--outdir=" + OUTPUT_DIR,
+
+        "--cfg=stylegan3-r",
+
+        "--data=" + dataset_zip,
+
+        f"--gpus={NUM_GPUS}",
+
+        f"--batch={BATCH_SIZE}",
+
+        f"--kimg={kimg}",
+
+        f"--snap={SNAPSHOT_INTERVAL}",
+
+        "--mirror=1",
+
+        "--metrics=fid50k_full"
+    ]
+
+    print("\nStarting StyleGAN3 training...")
+    print("Command:")
+    print(" ".join(command))
+
+    subprocess.run(
+        command,
+        check=True
+    )
+
+    print("\nStyleGAN3 training completed.")
+
+
+if __name__ == "__main__":
+    train_stylegan3()
+
+
+# ============================================================
+# After the 50-epoch training, use the trained StyleGAN3 checkpoint to generate synthetic MRI images.
+# ============================================================
+
+import subprocess
+from pathlib import Path
+
+
+NETWORK = (
+    "synthetic_data/stylegan3/runs/"
+    "00000-stylegan3-r/"
+    "network-snapshot-000050.pkl"
+)
+
+OUTPUT_DIR = (
+    "synthetic_data/generated_mri"
+)
+
+# Number of synthetic MRI images
+NUM_IMAGES = 1630
+
+# Random seed range
+SEED_START = 0
+SEED_END = NUM_IMAGES - 1
+
+
+def generate_images():
+
+    Path(OUTPUT_DIR).mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    command = [
+        "python",
+        "stylegan3/gen_images.py",
+
+        "--outdir=" + OUTPUT_DIR,
+
+        "--trunc=1",
+
+        f"--seeds={SEED_START}-{SEED_END}",
+
+        "--network=" + NETWORK
+    ]
+
+    print("Generating synthetic MRI images...")
+
+    subprocess.run(
+        command,
+        check=True
+    )
+
+    print(
+        f"{NUM_IMAGES} synthetic MRI images "
+        "generated successfully."
+    )
+
+
+if __name__ == "__main__":
+    generate_images()
